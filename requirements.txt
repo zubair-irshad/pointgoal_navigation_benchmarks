@@ -1,0 +1,6 @@
+dataclasses==0.6
+imgaug==0.3.0
+comet_ml==2.0.14
+matplotlib==3.1.0
+torchsummary==1.5.1
+Poutyne==0.6

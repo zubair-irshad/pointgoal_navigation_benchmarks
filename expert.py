@@ -6,9 +6,10 @@ import numpy as np
 import habitat
 import torch
 from habitat.core.utils import try_cv2_import
-from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
+from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower,action_to_one_hot
 from habitat.utils.visualizations import maps
 from habitat.utils.visualizations.utils import images_to_video
+from PIL import Image
 
 cv2 = try_cv2_import()
 
@@ -34,7 +35,7 @@ class Expert:
 		self.transform   = transform
 		self.scene_dir   = scene_dir
 
-	def read_observations_and_actions(self, num_scenes, num_episodes_per_scene, min_dist, max_dist):
+	def read_observations_and_actions(self, num_trajectories, min_dist, max_dist):
 		config                    = habitat.get_config(config_paths = self.config_path)
 		config.defrost()
 		config.DATASET.DATA_PATH  = self.data_path
@@ -52,36 +53,48 @@ class Expert:
 		follower.mode = self.mode
 		print("Environment creation successful")
 
-		num_trajectories = num_scenes*num_episodes_per_scene
-
 		im_out = []
 		ac_out = []
 		for episode in range(num_trajectories):
-			env.reset()
+
+			images =[]
+			actions=[]	
+			observations= env.reset()
+			# Get first image 
+			im = observations["rgb"]
+			im = Image.fromarray(im)
+			if self.transform is not None:
+				im = self.transform(im) 
+			images.append(im)
 
 			geodesic_distance =  env.habitat_env.current_episode.info['geodesic_distance']
 			if geodesic_distance >max_dist or geodesic_distance<min_dist:
 				continue      
 			print("Agent stepping around inside environment.")
-			images =[]
-			actions=[]	        
+		
 			while not env.habitat_env.episode_over:
 				best_action = follower.get_next_action(
 					env.habitat_env.current_episode.goals[0].position
 				)
+				# one_hot = action_to_one_hot(int(0 if best_action is None else best_action))
+				# act = torch.tensor(int(0 if best_action is None else best_action))
+				actions.append(torch.tensor(int(0 if best_action is None else best_action)))
+				
 				if best_action is None:
 					break
 				observations, reward, done, info = env.step(best_action)
 				im = observations["rgb"]
-
+				im = Image.fromarray(im)
 				if self.transform is not None:
 					im = self.transform(im) 
 				#Append images and actions for one trajectory	
 				images.append(im)
-				actions.append(best_action)
 
+			# actions = torch.LongTensor(actions).unsqueeze(0)
+			# actions = torch.tensor(actions)
 			images = torch.stack(images, dim=0)
-			actions = torch.Tensor(actions)
+			actions = torch.stack(actions, dim=0)
+
 			# actions = torch.stack(actions, dim=0)
 
 			# Some episodes run for 500 timesteps and are usually not optimal. Not including those episodes as part of the data here:

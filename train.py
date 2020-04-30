@@ -1,8 +1,3 @@
-# import os
-# os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
-from callbacks import CometCallback
-from comet_ml import Experiment
-
 import time
 import torch
 import torch.nn as nn
@@ -14,31 +9,26 @@ from   torchsummary import summary
 from   torchvision.utils import make_grid
 
 from Project import Project
-from data import get_dataloaders
-from data import dataset_utils
+from dataset import Dataset_RNN
 from utils import show_dataset,max_seq_length_list,device, show_one_batch, save_checkpoint
-from models import ResCNNEncoder, DecoderRNN
+from models import CNNEncoder, DecoderRNN
 
 import numpy as np
 import os
 import torch
 import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.utils.rnn import pad_sequence
 from torch.nn.utils.rnn import pack_padded_sequence
+from expert import Expert
 
 def pad_collate(batch):
-  (xx, yy, zz) = zip(*batch)
+  (xx, yy) = zip(*batch)
   x_lens = [len(x) for x in xx]
   y_lens = [len(y) for y in yy]
-  z_lens = [len(z) for z in zz]
-
   xx_pad = pad_sequence(xx, batch_first=True, padding_value=0)
-  yy_pad = pad_sequence(yy, batch_first=True, padding_value=0)
-  zz_pad = pad_sequence(zz, batch_first=True, padding_value=0)
-
-  return xx_pad, yy_pad, zz_pad, x_lens, y_lens, z_lens
+  yy_pad = pad_sequence(yy, batch_first=True, padding_value=-1)
+  return xx_pad, yy_pad, x_lens, y_lens
 
 
 def create_mask(batchsize, max_length, length,device):
@@ -46,243 +36,280 @@ def create_mask(batchsize, max_length, length,device):
     tensor_mask = torch.zeros(batchsize, max_length, dtype = torch.bool)
     for idx, row in enumerate(tensor_mask):
         row[:length[idx]] = 1
-
     tensor_mask.unsqueeze_(-1)
     return tensor_mask.to(device)
 
 
 
-def train(log_interval, model,criterion, device, train_loader, val_loader, optimizer, epoch, batch_size):
+def train(log_interval, model,criterion, device, train_loader, optimizer, epoch, batch_size, output_dim, params, writer):
     # set model as training mode
+
+    batch_time = AverageMeter('batch_time')
+    data_time = AverageMeter('data_time')
+    losses = AverageMeter('loss')
+    top1 = AverageMeter('accuracy')
+    # progress = ProgressMeter(len(train_loader),
+    #                          [batch_time, data_time, losses, top1],
+    #                          prefix="Epoch: [{}]".format(epoch))
+    N_count = 0   # counting total trained sample in one epoch
     cnn_encoder, rnn_decoder = model
     cnn_encoder.train()
     rnn_decoder.train()
-    val_losses = []
-    train_losses = []
-    min_val_loss = 1000
-    N_count = 0   # counting total trained sample in one epoch
-
     h = rnn_decoder.init_hidden(batch_size)
+    end = time.time()
 
-    for batch_idx, (X, y, pose, x_lengths,_,_) in enumerate(train_loader):
-        h = tuple([each.detach() for each in h])
-        # distribute data to device
-        X, y, pose = X.to(device), y.to(device), pose.to(device)
-        N_count += X.size(0)
-        # Create new variables for hidden state so we do not backprop the entire history
-        optimizer.zero_grad()
+    for batch_idx, (X, y, x_lengths,_) in enumerate(train_loader):
         
-
+        data_time.update(time.time() - end) # measure data loading time
+        h = tuple([each.detach() for each in h]) # Create new variables for hidden state so we do not backprop the entire history   
+        X, y = X.to(device), y.to(device) # distribute data to device
+        
+        N_count += X.size(0)
+        #CNN_output and CNN Mask
         encoder_out = cnn_encoder(X)
-        embed_mask = create_mask(encoder_out.shape[0],encoder_out.shape[1], x_lengths, device)
+        embed_mask = create_mask(encoder_out.shape[0],encoder_out.shape[1], x_lengths,device)
         embed_mask = embed_mask.expand_as(encoder_out)
         encoder_out = encoder_out*embed_mask
 
-        encoder_out = torch.cat((encoder_out, pose),2) # Encode pose_features to the image features
+        #RNN Output
+        output,h = rnn_decoder(encoder_out,h, x_lengths)   # output has dim = (batch*seq_length, number of outputs)
 
-        output,h = rnn_decoder(encoder_out, h, x_lengths)   # output has dim = (batch*seq_length, number of outputs)
+        #Creat RNN_mask
+        decoder_mask = create_mask(encoder_out.shape[0], encoder_out.shape[1], x_lengths, device)
+        decoder_mask = decoder_mask.expand(encoder_out.shape[0], encoder_out.shape[1], output_dim)
+        decoder_mask = decoder_mask.view(-1,output_dim)
+        output=output*decoder_mask
 
-        loss = criterion(output, y.view(-1,y.shape[2]).float())
-        # # to compute accuracy
-        # y_pred = torch.max(output, 1)[1]  # y_pred != output
-        # step_score = accuracy_score(y.cpu().data.squeeze().numpy(), y_pred.cpu().data.squeeze().numpy())
-        # scores.append(step_score)         # computed on CPU
+        # encoder_out = torch.cat((encoder_out, pose),2) # Encode pose_features to the image features
 
+        #Compute Loss & accuracy
+        loss = criterion(output, y.view(-1,1).squeeze(1))
+        acc = accuracy(output, y.view(-1,1))
+        losses.update(loss.item(), X.size(0))
+        top1.update(acc, X.size(0))
+        
+        optimizer.zero_grad()
         loss.backward()
         # nn.utils.clip_grad_norm_(rnn_decoder.parameters(), clip)
         optimizer.step()
 
-        # show information
-        if (batch_idx + 1) % log_interval == 0: 
-            # Get validation loss
-            val_h = rnn_decoder.init_hidden(batch_size)
-            cnn_encoder.eval()
-            rnn_decoder.eval()
-            with torch.no_grad():
-                for X, y, pose, x_lengths,_,_ in val_loader:
-                    val_h = tuple([each.data for each in val_h])
-                    # distribute data to device
-                    X, y, pose  = X.to(device), y.to(device), pose.to(device)
-                    encoder_out = cnn_encoder(X)
-                    embed_mask  = create_mask(encoder_out.shape[0],encoder_out.shape[1], x_lengths,device)
-                    embed_mask  = embed_mask.expand_as(encoder_out)
-                    encoder_out = encoder_out*embed_mask
-                    encoder_out = torch.cat((encoder_out, pose),2) # Encode pose_features to the image features
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
 
-                    output,val_h = rnn_decoder(encoder_out, val_h, x_lengths)   # output has dim = (batch*seq_length, number of outputs)
 
-                    val_loss = criterion(output, y.view(-1,y.shape[2]).float())
-                    val_losses.append(val_loss.item())
-            
-            cnn_encoder.train()
-            rnn_decoder.train()
-
+        if (batch_idx+1) % log_interval == 0:
+            # print(batch_idx+1)
+            # print(epoch+1)
+            current_iter = (batch_idx+1) + epoch*(len(train_loader))
             print("Epoch: {}/{}...".format(epoch+1, params['epochs']),
                   "Step: [{}/{} ({:.0f}%)]...".format(N_count, len(train_loader.dataset), 100. * (batch_idx + 1) / len(train_loader)),
-                  "Loss: {:.6f}...".format(loss.item()),
-                  "Val Loss: {:.6f}".format(np.mean(val_losses)))
+                  "Time {batch_time.val:.3f} ({batch_time.avg:.3f})".format(batch_time=batch_time),
+                  "Train Loss {loss.val:.4f} ({loss.avg:.4f})".format(loss=losses),
+                  "Train Accuracy {accuracy.val:.4f} ({accuracy.avg:.4f})".format(accuracy=top1))
+            writer.add_scalar('train/loss_train', losses.avg,current_iter)
+            writer.add_scalar('train/accuracy', top1.avg,current_iter)
 
+def validate(log_interval, model,criterion, device, val_loader, epoch, batch_size, output_dim, params, writer):
+
+    batch_time = AverageMeter('batch_time')
+    losses = AverageMeter('loss')
+    top1 = AverageMeter('accuracy')
+    N_count = 0   # counting total trained sample in one epoch
     
-    # is_best = bool(np.mean(val_losses) < min_val_loss)
-    # min_val_loss = min(np.mean(val_losses), min_val_loss)
-    # ckpt_filename = os.path.join(save_model_path, 'Enocder_Decoder_epoch{}.pth'.format(epoch + 1))
-    # save_checkpoint({'cnn_encoder_state_dict': cnn_encoder.state_dict(),
-    #                  'rnn_decoder_state_dict': rnn_decoder.state_dict(),
-    #                  'optimizer': optimizer.state_dict()}, 
-    #                   is_best, ckpt_filename)
-
-
-
-
-    writer.add_scalar('Loss',loss.item(),epoch) # do the same as val_losses
-    writer.add_scalar('Mean_Val_Loss',np.mean(val_losses),epoch)
-
-    return train_losses, val_losses
-
-def validation(model, criterion, device, optimizer, test_loader):
     # set model as testing mode
     cnn_encoder, rnn_decoder = model
     cnn_encoder.eval()
     rnn_decoder.eval()
+    val_h = rnn_decoder.init_hidden(batch_size)
 
-    test_loss = 0
-    all_y = []
-    all_y_pred = []
     with torch.no_grad():
-        for X, y in test_loader:
-            # distribute data to device
-            X, y = X.to(device), y.to(device)
-            batch_size = X.shape[0]
-            h = rnn_decoder.init_hidden(batch_size)
-            output, h = rnn_decoder(cnn_encoder(X),h)
+        end = time.time()
+        for batch_idx, (X, y, x_lengths,_) in enumerate(val_loader):
+            val_h = tuple([each.detach() for each in val_h]) # Create new variables for hidden state so we do not backprop the entire history   
+            X, y = X.to(device), y.to(device) # distribute data to device
+            N_count += X.size(0)
+            #CNN_output and CNN Mask
+            encoder_out = cnn_encoder(X)
+            embed_mask = create_mask(encoder_out.shape[0],encoder_out.shape[1], x_lengths,device)
+            embed_mask = embed_mask.expand_as(encoder_out)
+            encoder_out = encoder_out*embed_mask
 
-            loss = criterion(output, y.view(-1,y.shape[2]).float())
-            test_loss += loss.item()                 # sum up batch loss
-            # y_pred = output.max(1, keepdim=True)[1]  # (y_pred != output) get the index of the max log-probability
+            #RNN Output
+            output,val_h = rnn_decoder(encoder_out,val_h, x_lengths)   # output has dim = (batch*seq_length, number of outputs)
 
-            # # collect all y and y_pred in all batches
-            # all_y.extend(y)
-            # all_y_pred.extend(y_pred)
+            #Creat RNN_mask
+            decoder_mask = create_mask(encoder_out.shape[0], encoder_out.shape[1], x_lengths, device)
+            decoder_mask = decoder_mask.expand(encoder_out.shape[0], encoder_out.shape[1], output_dim)
+            decoder_mask = decoder_mask.view(-1,output_dim)
+            output=output*decoder_mask
 
-    test_loss /= len(test_loader.dataset)
+            # encoder_out = torch.cat((encoder_out, pose),2) # Encode pose_features to the image features
 
-    # # compute accuracy
-    # all_y = torch.stack(all_y, dim=0)
-    # all_y_pred = torch.stack(all_y_pred, dim=0)
-    # test_score = accuracy_score(all_y.cpu().data.squeeze().numpy(), all_y_pred.cpu().data.squeeze().numpy())
+            #Compute Loss & accuracy
+            loss = criterion(output, y.view(-1,1).squeeze(1))
+            acc = accuracy(output, y.view(-1,1))
+            losses.update(loss.item(), X.size(0))
+            top1.update(acc, X.size(0))
 
-    # show information
-    print('\nTest set ({:d} samples): Average loss: {:.4f}\\n'.format(len(train_loader.dataset), test_loss))
+                    # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
 
-    # save Pytorch models of best record
-    # torch.save(cnn_encoder.state_dict(), os.path.join(save_model_path, 'cnn_encoder_epoch{}.pth'.format(epoch + 1)))  # save spatial_encoder
-    # torch.save(rnn_decoder.state_dict(), os.path.join(save_model_path, 'rnn_decoder_epoch{}.pth'.format(epoch + 1)))  # save motion_encoder
-    # torch.save(optimizer.state_dict(), os.path.join(save_model_path, 'optimizer_epoch{}.pth'.format(epoch + 1)))      # save optimizer
-    # print("Epoch {} model saved!".format(epoch + 1))
-    return test_loss
 
-if __name__ == '__main__':
+            if (batch_idx + 1) % log_interval == 0:
+                # progress.display(batch_idx)
+                current_iter = (batch_idx+1) + epoch*(len(val_loader))
+                print(current_iter)
+                print("Epoch: {}/{}...".format(epoch+1, params['epochs']),
+                      "Step: [{}/{} ({:.0f}%)]...".format(N_count, len(val_loader.dataset), 100. * (batch_idx + 1) / len(val_loader)),
+                      "Time {batch_time.val:.3f} ({batch_time.avg:.3f})".format(batch_time=batch_time),
+                      "Val Loss {loss.val:.4f} ({loss.avg:.4f})".format(loss=losses),
+                      "Val Accuracy {accuracy.val:.4f} ({accuracy.avg:.4f})".format(accuracy=top1))
+                writer.add_scalar('val/loss_val', losses.avg,current_iter)
+                writer.add_scalar('val/accuracy_val', top1.avg,current_iter)
 
-    PATH_TO_LOGGING = '/home/mirshad7/hierarchical_imitation/learning_module/logging/GibsontinyandMedium'
+def main():
+
+    PATH_TO_LOGGING = '/home/mirshad7/habitat_imitation_learning/logger'
     save_model_path = '/home/mirshad7/hierarchical_imitation/learning_module/checkpoint'
     writer = SummaryWriter(PATH_TO_LOGGING)
 
     # EncoderCNN architecture
-    CNN_fc_hidden1, CNN_fc_hidden2,CNN_fc_hidden3 = 1500,1024,512
-    CNN_embed_dim = 300      # latent dim extracted by 2D CNN
-    img_x, img_y = 224,224 #Specify crop image sizes here 
-    dropout_p_CNN = 0.3          # dropout probability
+    CNN_fc_hidden1   = 256
+    CNN_embed_dim    = 150      # latent dim extracted by 2D CNN
+    dropout_p_CNN    = 0.3          # dropout probability
     pose_feature_dim = 72
 
     # DecoderRNN architecture
     RNN_hidden_layers = 3
-    RNN_hidden_nodes = 128
-    RNN_FC_dim = 64
-    output_dim =2
-    dropout_p_RNN = 0.3          # dropout probability
+    RNN_hidden_nodes = 100
+    RNN_FC_dim = 50
+    output_dim = 6
+    dropout_p_RNN = 0.3
 
     # Detect devices
+    img_x=224
+    img_y=224
     use_cuda = torch.cuda.is_available()                   # check if GPU exists
     device = torch.device("cuda" if use_cuda else "cpu")   # use CPU or GPU
-
-    project = Project()
-    # our hyperparameters
-    # log_interval =30
     params = {
         'lr': 1e-4,
-        'batch_size': 20,
+        'batch_size': 15,
         'epochs': 30,
         'model': 'enoder_decoder'
     }
+
+    #Expert Params
+    num_scenes             = 72
+    num_episodes_per_scene = 10
+    min_distance           = 2
+    max_distance           = 18
+    val_split              = 0.2
+    data_path_train        = 'data/datasets/pointnav/gibson/v1/all/training_batch_0.json.gz'
+    data_path_val          = 'data/datasets/pointnav/gibson/v1/val/val.json.gz'
+    scene_dir              = 'data/scene_datasets/'
+    mode                   = "exact_gradient"
+    config_path            = "configs/tasks/pointnav_gibson.yaml"
+
+    num_traj_train = num_scenes*num_episodes_per_scene
+    num_traj_val   = int(num_traj_train*val_split)
+    
     dataloader_params = {'batch_size': params['batch_size'], 'shuffle': True, 'num_workers': 0, 'pin_memory': True} if use_cuda else {}
     log_interval  = 3   # interval for displaying training info
-   
-    
-    # logging.info(f'Using device={device} 🚀')
-
-    #Preparing data for datalaoding
-
-
-    begin_frame, end_frame, skip_frame = 3, 20, 1
-    selected_frames = np.arange(begin_frame, end_frame, skip_frame).tolist()
-
     transform = transforms.Compose([transforms.Resize([img_x, img_y]),
                                 transforms.ToTensor(),
                                 transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                                     std=[0.229, 0.224, 0.225])])
 
-    #Load directory names here
-    data_path = project.data_dir
-    fnames = os.listdir(data_path)
-    all_names = []
-    for f in fnames:
-        all_names.append(f)
+    expert_train                = Expert(data_path_train, scene_dir, mode, config_path, transform)
+    images_train, actions_train = expert_train.read_observations_and_actions(num_traj_train,min_distance, max_distance)
+
+    expert_val                  = Expert(data_path_val, scene_dir, mode, config_path, transform)
+    images_val, actions_val     = expert_train.read_observations_and_actions(num_traj_val,min_distance, max_distance)
 
 
-    all_X_list = all_names    
-    train_list, test_list = train_test_split(all_X_list,test_size=0.20, random_state=42)
-    train_list,val_list = train_test_split(train_list, test_size=0.25, random_state=1)
-
-    train_seq_length, max_tsq_length, min_tsq_length = max_seq_length_list(train_list)
-    val_seq_length, max_vsq_length, min_vsq_length = max_seq_length_list(val_list)
-    test_seq_length, max_tssq_length, min_tssq_length = max_seq_length_list(test_list)
-
-
-
-    train_set, val_set,test_set = dataset_utils.Dataset_RNN(data_path, train_list, train_seq_length, transform=transform), \
-                                  dataset_utils.Dataset_RNN(data_path, val_list  , val_seq_length  , transform=transform), \
-                                  dataset_utils.Dataset_RNN(data_path, test_list , test_seq_length , transform=transform), \
-
-
-    train_loader = data.DataLoader(train_set, **dataloader_params, collate_fn = pad_collate, drop_last=True)
+    #Define dataset here
+    train_set    = Dataset_RNN(images_train, actions_train)
+    val_set      = Dataset_RNN(images_val, actions_val)    
+    train_loader = data.DataLoader(train_set, **dataloader_params, collate_fn = pad_collate,drop_last=True)
     val_loader   = data.DataLoader(val_set, **dataloader_params, collate_fn = pad_collate,drop_last=True)
-    test_loader  = data.DataLoader(test_set, **dataloader_params, collate_fn = pad_collate,drop_last=True)
 
-    #SHOW TRAINING LOADER HERE
-    # show_one_batch(train_loader,5,5)
-    # show_one_batch(valid_loader,5,5)
 
-    # define our comet experiment
-    # experiment = Experiment(api_key="QpL4OYD7n2TtWST5joo7FYJlG",
-    #                         project_name="hierarhical-imitation", workspace="mirshad7")
-    # experiment.log_parameters(params)
-
+    print("==================================================================================")
+    print("                    ...DATA LOADING DONE....                                      ")
+    print("                    ...STARTING TRAIN LOOP....                                      ")
+    print("==================================================================================")
 
     # Create model
-    cnn_encoder = ResCNNEncoder(fc_hidden1=CNN_fc_hidden1, fc_hidden2=CNN_fc_hidden2, drop_p=dropout_p_CNN, CNN_embed_dim=CNN_embed_dim).to(device)
-    rnn_decoder = DecoderRNN(embed_dim=CNN_embed_dim+pose_feature_dim, h_RNN_layers=RNN_hidden_layers, num_hidden=RNN_hidden_nodes, h_FC_dim=RNN_FC_dim, drop_prob=dropout_p_RNN, output_dim=output_dim).to(device)
-    
-    crnn_params = list(cnn_encoder.parameters()) + list(rnn_decoder.parameters())
+    cnn_encoder = CNNEncoder(fc_hidden1=CNN_fc_hidden1, CNN_embed_dim=CNN_embed_dim, drop_p=dropout_p_CNN).to(device)
+    rnn_decoder = DecoderRNN(embed_dim=CNN_embed_dim, h_RNN_layers=RNN_hidden_layers, 
+                             num_hidden=RNN_hidden_nodes, h_FC_dim=RNN_FC_dim, drop_prob=dropout_p_RNN, 
+                             num_classes=output_dim).to(device)
+
+    crnn_params = list(cnn_encoder.fc1.parameters()) + list(cnn_encoder.bn1.parameters()) + \
+              list(cnn_encoder.fc2.parameters()) + list(rnn_decoder.parameters())
+
     optimizer = torch.optim.Adam(crnn_params, lr=params['lr'])
-    criterion = nn.MSELoss()
+    criterion = nn.CrossEntropyLoss(ignore_index=-1)
 
 
     #train model
-    epoch_train_losses=[]
-    epoch_test_losses=[]
     for epoch in range(params['epochs']):
-        t_losses, v_losses     = train(log_interval, [cnn_encoder, rnn_decoder],criterion, device, train_loader, val_loader, optimizer, epoch, params['batch_size'])
+        train(log_interval, [cnn_encoder, rnn_decoder],criterion, device, train_loader, optimizer, epoch, params['batch_size'], output_dim, params,writer)
+        validate(log_interval, [cnn_encoder, rnn_decoder],criterion, device, val_loader, epoch, params['batch_size'],output_dim, params, writer)
         
-    # # get the results on the test set
-    # logging.info(f'test_acc=({test_acc})')
-    # experiment.log_metric('test_acc', test_acc)
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self, name, fmt=':f'):
+        self.name = name
+        self.fmt = fmt
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+    def __str__(self):
+        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
+        return fmtstr.format(**self.__dict__)
+
+
+class ProgressMeter(object):
+    def __init__(self, num_batches, meters, prefix=""):
+        self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
+        self.meters = meters
+        self.prefix = prefix
+
+    def display(self, batch):
+        entries = [self.prefix + self.batch_fmtstr.format(batch)]
+        entries += [str(meter) for meter in self.meters]
+        print('\t'.join(entries))
+
+    def _get_batch_fmtstr(self, num_batches):
+        num_digits = len(str(num_batches // 1))
+        fmt = '{:' + str(num_digits) + 'd}'
+        return '[' + fmt + '/' + fmt.format(num_batches) + ']'
+
+def accuracy(output, target):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        total = target[target!=-1].shape[0]
+        _, pred = output.topk(1,1, True)
+        pred    = pred[target!=-1]
+        target  = target[target!=-1]
+        correct = pred.eq(target).sum().cpu().numpy()
+        res = correct*(100/total)
+        return res
+
+if __name__ == '__main__':
+    main()

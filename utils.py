@@ -41,7 +41,7 @@ def show_one_batch(dl, rows, cols):
     imgs=[]
     for i in range(rows):
         for j in range(cols):
-            imgs.append(images[i,j,:,:])
+            imgs.append(images[i,5*j,:,:])
             
     print(len(imgs))
     grid = make_grid(imgs,nrow=rows)

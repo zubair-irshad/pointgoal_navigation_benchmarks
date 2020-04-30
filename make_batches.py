@@ -32,9 +32,9 @@ def main():
     # ------content
     # ----------env_name.json.gz
     scenes  = glob.glob("/home/mirshad7/habitat-api/data/datasets/pointnav/gibson/v1/train/content/*.json.gz")
-    out_dir = f'../data/datasets/pointnav/gibson/v1/all/'
+    out_dir = f'../data/datasets/pointnav/gibson/v1/all_val/'
 
-    num_episodes_per_scene = 10
+    num_episodes_per_scene = 2
     total_batches = 100
 
     make_batches(scenes, out_dir,num_episodes_per_scene,total_batches)

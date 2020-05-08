@@ -1,4 +1,7 @@
 # Habitat Supervised Learning Baselines
+
+## Detailed report regarding this work can be accessed here: [Supervised Learning Benchmarks for Point Goal Navigation in Photo-realistic indoor cluttered](https://zubairirshad.com/portfolio/supervised-learning-benchmarks-for-embodied-visual-navigation-in-habitat/)
+
 ## Behavior Cloning
 
 #### Installation

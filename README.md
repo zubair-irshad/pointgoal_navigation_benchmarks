@@ -51,10 +51,13 @@ expert.py #provides various functions to get optimal shortest path for any datap
 ```
 python train.py
 ```
+
 #### Hyperparameters 
 
+![Hyperparameters](https://github.com/zubair-irshad/habitat_imitation_learning/blob/master/logger/hyperparameters.png)
 
-#### Preliminary Results 
+#### Preliminary Results
+![Resukts](https://github.com/zubair-irshad/habitat_imitation_learning/blob/master/logger/plots.jpg)
 
 
 #### Future Work 

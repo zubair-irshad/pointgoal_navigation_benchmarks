@@ -51,5 +51,13 @@ expert.py #provides various functions to get optimal shortest path for any datap
 ```
 python train.py
 ```
+#### Hyperparameters 
 
+
+#### Preliminary Results 
+
+
+#### Future Work 
+- Implement [imitation learning pipeline](https://www.ri.cmu.edu/pub_files/2011/4/Ross-AISTATS11-NoRegret.pdf)
+- Evaluating approach in real-time simulation in habitat-api and tracking various metrics including [SPL](https://arxiv.org/abs/1807.06757)
 

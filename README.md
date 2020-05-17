@@ -44,9 +44,6 @@ python make_batches.py
 expert.py #provides various functions to get optimal shortest path for any datapoint
 ```
 
-- Initial implementation and usage of expert.py and [dataloader] can be seen in playground.ipynb notebook
-
-
 #### Train 
 ```
 python train.py
